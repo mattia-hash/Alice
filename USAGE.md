@@ -145,6 +145,20 @@ Add to your `.env` file:
 SYSTEM_PROMPT=You are Alice, a helpful assistant specialized in Python development. Always write clean, documented code.
 ```
 
+### Show Model Thinking Process
+
+Some models (like DeepSeek-R1) output their reasoning in `<think>` tags. By default, these are **hidden** for cleaner output. To show them in dimmed gray text, add to your `.env`:
+
+```env
+SHOW_THINKING=true
+```
+
+**Example output with thinking shown:**
+
+```
+Assistant: [thinking: User said hello, I should greet them...] Hello! How can I help you today?
+```
+
 ### Temperature & Parameters
 
 Currently hardcoded to `0.7`. To customize, edit `app.py`:

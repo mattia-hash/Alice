@@ -40,13 +40,15 @@ class LLMClient:
             return [{'role': 'system', 'content': self.system_prompt}] + messages
         return messages
     
-    def stream_chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> Iterator[str]:
+    def stream_chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, 
+                    tools: Optional[List[Dict]] = None) -> Iterator[str]:
         """
         Stream chat completion responses.
         
         Args:
             messages: List of message dicts with 'role' and 'content'
             temperature: Sampling temperature
+            tools: Optional list of tool schemas for function calling
             
         Yields:
             Content chunks as they arrive
@@ -54,11 +56,11 @@ class LLMClient:
         messages = self._build_messages(messages)
         
         if self.api_type == 'ollama':
-            yield from self._stream_ollama(messages, temperature)
+            yield from self._stream_ollama(messages, temperature, tools)
         else:
-            yield from self._stream_openai(messages, temperature)
+            yield from self._stream_openai(messages, temperature, tools)
     
-    def _stream_ollama(self, messages: List[Dict], temperature: float) -> Iterator[str]:
+    def _stream_ollama(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
         """Stream from Ollama API."""
         payload = {
             'model': self.model_name,
@@ -68,6 +70,10 @@ class LLMClient:
                 'temperature': temperature
             }
         }
+        
+        # Add tools if provided (Ollama supports tools)
+        if tools:
+            payload['tools'] = tools
         
         try:
             with requests.post(self.base_url, json=payload, stream=True, timeout=120) as response:
@@ -87,7 +93,7 @@ class LLMClient:
         except requests.exceptions.RequestException as e:
             yield f"\n[Error: {str(e)}]"
     
-    def _stream_openai(self, messages: List[Dict], temperature: float) -> Iterator[str]:
+    def _stream_openai(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
         """Stream from OpenAI-compatible API (LM Studio, etc.)."""
         payload = {
             'model': self.model_name,
@@ -95,6 +101,10 @@ class LLMClient:
             'stream': True,
             'temperature': temperature
         }
+        
+        # Add tools if provided
+        if tools:
+            payload['tools'] = tools
         
         try:
             with requests.post(self.base_url, json=payload, stream=True, timeout=120) as response:
@@ -124,21 +134,55 @@ class LLMClient:
         except requests.exceptions.RequestException as e:
             yield f"\n[Error: {str(e)}]"
     
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, 
+             tools: Optional[List[Dict]] = None) -> Dict:
         """
-        Non-streaming chat completion (collects full response).
+        Non-streaming chat completion (collects full response including tool calls).
         
         Args:
             messages: List of message dicts
             temperature: Sampling temperature
+            tools: Optional list of tool schemas
             
         Returns:
-            Complete response text
+            Dict with 'content' (text) and optional 'tool_calls' (list)
         """
-        chunks = []
-        for chunk in self.stream_chat(messages, temperature):
-            chunks.append(chunk)
-        return ''.join(chunks)
+        messages = self._build_messages(messages)
+        
+        payload = {
+            'model': self.model_name,
+            'messages': messages,
+            'temperature': temperature,
+            'stream': False
+        }
+        
+        if tools:
+            payload['tools'] = tools
+        
+        try:
+            response = requests.post(self.base_url, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Parse response based on API type
+            if self.api_type == 'ollama':
+                message = data.get('message', {})
+                return {
+                    'content': message.get('content', ''),
+                    'tool_calls': message.get('tool_calls', [])
+                }
+            else:  # OpenAI format
+                if 'choices' in data and len(data['choices']) > 0:
+                    message = data['choices'][0].get('message', {})
+                    return {
+                        'content': message.get('content', ''),
+                        'tool_calls': message.get('tool_calls', [])
+                    }
+            
+            return {'content': '', 'tool_calls': []}
+            
+        except requests.exceptions.RequestException as e:
+            return {'content': f"[Error: {str(e)}]", 'tool_calls': []}
     
     def parse_action(self, response: str) -> Dict:
         """
