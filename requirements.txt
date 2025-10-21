@@ -1,0 +1,11 @@
+# Core dependencies
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Database
+sqlite3  # built-in, but listed for clarity
+
+# Optional: For future LangGraph integration
+# langgraph>=0.0.1
+# langchain>=0.1.0
+
