@@ -5,14 +5,24 @@ Compatible with both Ollama and OpenAI-compatible APIs (like LM Studio).
 
 import json
 import requests
+import warnings
+import logging
 from typing import Iterator, Dict, List, Optional
 from urllib.parse import urlparse
+
+# Disable SSL warnings for self-signed certificates
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+
+# Setup logging (will be configured by main app)
+logger = logging.getLogger(__name__)
 
 
 class LLMClient:
     """Streaming LLM client supporting multiple backends."""
     
-    def __init__(self, base_url: str, model_name: str, system_prompt: Optional[str] = None):
+    def __init__(self, base_url: str, model_name: str, system_prompt: Optional[str] = None,
+                 username: Optional[str] = None, password: Optional[str] = None,
+                 context_length: Optional[int] = None):
         """
         Initialize LLM client.
         
@@ -20,17 +30,21 @@ class LLMClient:
             base_url: API endpoint URL (e.g., http://localhost:1234/v1/chat/completions)
             model_name: Name of the model to use
             system_prompt: Optional system prompt
+            username: Optional username for basic auth
+            password: Optional password for basic auth
         """
         self.base_url = base_url
         self.model_name = model_name
         self.system_prompt = system_prompt
+        self.auth = (username, password) if username and password else None
+        self.context_length = context_length
         
         # Detect API type based on URL
         self.api_type = self._detect_api_type(base_url)
     
     def _detect_api_type(self, url: str) -> str:
         """Detect if we're using Ollama or OpenAI-compatible API."""
-        if 'ollama' in url or '/api/chat' in url:
+        if 'ollama' in url or '/api/chat' in url or '/api/generate' in url:
             return 'ollama'
         return 'openai'
     
@@ -62,35 +76,91 @@ class LLMClient:
     
     def _stream_ollama(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
         """Stream from Ollama API."""
-        payload = {
-            'model': self.model_name,
-            'messages': messages,
-            'stream': True,
-            'options': {
-                'temperature': temperature
-            }
-        }
+        # Check if using /api/generate (prompt-based) or /api/chat (message-based)
+        is_generate = '/api/generate' in self.base_url
         
-        # Add tools if provided (Ollama supports tools)
-        if tools:
-            payload['tools'] = tools
+        if is_generate:
+            # For /api/generate, we need to use prompt instead of messages
+            # Combine messages into a single prompt
+            prompt_parts = []
+            for msg in messages:
+                role = msg.get('role', '')
+                content = msg.get('content', '')
+                if role == 'system':
+                    prompt_parts.append(f"System: {content}")
+                elif role == 'user':
+                    prompt_parts.append(f"User: {content}")
+                elif role == 'assistant':
+                    prompt_parts.append(f"Assistant: {content}")
+            
+            prompt = '\n\n'.join(prompt_parts) + '\n\nAssistant:'
+            
+            payload = {
+                'model': self.model_name,
+                'prompt': prompt,
+                'stream': True,
+                'options': {
+                    'temperature': temperature
+                }
+            }
+        else:
+            # For /api/chat, use messages format
+            payload = {
+                'model': self.model_name,
+                'messages': messages,
+                'stream': True,
+                'options': {
+                    'temperature': temperature
+                }
+            }
+            
+            # Add tools if provided (only for /api/chat)
+            if tools:
+                payload['tools'] = tools
+        
+        # Inject context length for Ollama, if provided
+        try:
+            if self.context_length and isinstance(payload, dict):
+                options = payload.setdefault('options', {})
+                # Ollama expects 'num_ctx' (context window tokens)
+                options['num_ctx'] = int(self.context_length)
+        except Exception:
+            pass
+
+        logger.debug(f"Ollama request to {self.base_url}")
+        logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+        logger.debug(f"Auth: {'Enabled' if self.auth else 'Disabled'}")
         
         try:
-            with requests.post(self.base_url, json=payload, stream=True, timeout=120) as response:
+            with requests.post(self.base_url, json=payload, stream=True, timeout=120, auth=self.auth, verify=False) as response:
+                logger.debug(f"Response status: {response.status_code}")
+                logger.debug(f"Response headers: {dict(response.headers)}")
                 response.raise_for_status()
                 
+                line_count = 0
                 for line in response.iter_lines():
                     if line:
+                        line_count += 1
+                        logger.debug(f"Line {line_count}: {line[:200]}")  # Log first 200 chars
                         try:
                             chunk = json.loads(line)
+                            # Handle both /api/chat and /api/generate formats
                             if 'message' in chunk and 'content' in chunk['message']:
                                 content = chunk['message']['content']
                                 if content:
                                     yield content
-                        except json.JSONDecodeError:
+                            elif 'response' in chunk:  # /api/generate format
+                                content = chunk['response']
+                                if content:
+                                    yield content
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON decode error: {e}, Line: {line}")
                             continue
+                
+                logger.debug(f"Total lines received: {line_count}")
                             
         except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {str(e)}")
             yield f"\n[Error: {str(e)}]"
     
     def _stream_openai(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
@@ -106,8 +176,15 @@ class LLMClient:
         if tools:
             payload['tools'] = tools
         
+        # Best-effort: map context length to OpenAI-compatible 'max_tokens' (output limit)
         try:
-            with requests.post(self.base_url, json=payload, stream=True, timeout=120) as response:
+            if self.context_length:
+                payload['max_tokens'] = int(self.context_length)
+        except Exception:
+            pass
+
+        try:
+            with requests.post(self.base_url, json=payload, stream=True, timeout=120, auth=self.auth, verify=False) as response:
                 response.raise_for_status()
                 
                 for line in response.iter_lines():
@@ -159,10 +236,27 @@ class LLMClient:
         if tools:
             payload['tools'] = tools
         
+        # Inject context length per backend
         try:
-            response = requests.post(self.base_url, json=payload, timeout=120)
+            if self.api_type == 'ollama':
+                options = payload.setdefault('options', {})
+                options['temperature'] = temperature
+                if self.context_length:
+                    options['num_ctx'] = int(self.context_length)
+            else:
+                if self.context_length:
+                    payload['max_tokens'] = int(self.context_length)
+        except Exception:
+            pass
+        
+        try:
+            logger.debug(f"Non-streaming request to {self.base_url}")
+            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+            response = requests.post(self.base_url, json=payload, timeout=120, auth=self.auth, verify=False)
+            logger.debug(f"Response status: {response.status_code}")
             response.raise_for_status()
             data = response.json()
+            logger.debug(f"Response data: {json.dumps(data, indent=2)[:500]}")
             
             # Parse response based on API type
             if self.api_type == 'ollama':
