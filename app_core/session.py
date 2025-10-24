@@ -47,7 +47,7 @@ class ChatSession:
             while True:
                 try:
                     cwd_short = os.path.basename(self.executor.cwd) or self.executor.cwd
-                    user_input = input(f"{Colors.GREEN}You [{cwd_short}]: {Colors.RESET}").strip()
+                    user_input = input(f"{Colors.GREEN}Mattia [{cwd_short}]: {Colors.RESET}").strip()
                 except EOFError:
                     break
 
@@ -89,7 +89,7 @@ class ChatSession:
 
                             if content and content.strip():
                                 if not tool_calls or iteration > 1:
-                                    print(f"{Colors.BLUE}Assistant: {Colors.RESET}", end='')
+                                    print(f"{Colors.BLUE}Alice: {Colors.RESET}", end='')
                                     thinking_filter = ThinkingFilter(show_thinking=self.config.show_thinking)
                                     filtered_content = thinking_filter.process_chunk(content)
                                     filtered_content += thinking_filter.finalize()
@@ -161,7 +161,7 @@ class ChatSession:
                                     self.memory.add_message(self.config.session_id, 'system', f"Tool {result['name']}: {result['content']}")
                                 break
                         else:
-                            print(f"{Colors.BLUE}Assistant: {Colors.RESET}", end='')
+                            print(f"{Colors.BLUE}Alice: {Colors.RESET}", end='')
                             thinking_filter = ThinkingFilter(show_thinking=self.config.show_thinking)
                             full_content_parts: List[str] = []
                             for chunk in self.llm.stream_chat(messages, temperature=0.7, tools=None):

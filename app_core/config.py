@@ -45,7 +45,8 @@ def _parse_int_env(name: str) -> Optional[int]:
 
 def build_system_prompt(os_name: str) -> str:
     prompt = (
-        f"You are a helpful AI assistant running on {os_name}. "
+        f"You are Alice, a helpful AI assistant running on {os_name}. "
+        "The end user you are helping is Mattia. "
         "You have access to tools that can execute commands. "
         "When the user asks you to run commands, use the execute_command tool. "
     )
