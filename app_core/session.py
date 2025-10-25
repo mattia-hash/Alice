@@ -99,13 +99,15 @@ class ChatSession:
                             # Stream assistant text while exposing tools so model knows about them
                             # Only pass tools if user requested it with /tool
                             tools_to_use = get_llm_tool_schemas() if enable_tools else None
+                            displayed_lines = 0
                             if enable_tools:
                                 print_colored("🛠️  Tool mode enabled for this request", Colors.CYAN)
+                                displayed_lines += 1  # account for tool mode message line
                             
                             print(f"{Colors.BLUE}Alice: {Colors.RESET}", end='')
                             thinking_filter = ThinkingFilter(show_thinking=self.config.show_thinking)
                             streamed_chunks: List[str] = []
-                            displayed_lines = 1  # includes the label line
+                            displayed_lines += 1  # includes the "Alice:" label line
                             for chunk in self.llm.stream_chat(messages, temperature=0.7, tools=tools_to_use):
                                 filtered = thinking_filter.process_chunk(chunk)
                                 if filtered:
@@ -123,14 +125,19 @@ class ChatSession:
                             logger.debug(f"Streamed content length: {len(content_streamed)}")
                             logger.debug(f"Streamed content: {content_streamed[:200]}")
 
-                            # After streaming, check for formal tool calls using a non-streaming request
-                            # Only pass tools if user requested it with /tool
-                            response = self.llm.chat(messages, tools=tools_to_use)
-                            tool_calls = response.get('tool_calls', [])
-                            content_full = response.get('content', '')
-                            
-                            logger.debug(f"Non-streaming content: {content_full[:200]}")
-                            logger.debug(f"Tool calls: {len(tool_calls)}")
+                            # Only check for tool calls if we actually passed tools to the model
+                            if enable_tools:
+                                # After streaming, check for formal tool calls using a non-streaming request
+                                response = self.llm.chat(messages, tools=tools_to_use)
+                                tool_calls = response.get('tool_calls', [])
+                                content_full = response.get('content', '')
+                                
+                                logger.debug(f"Non-streaming content: {content_full[:200]}")
+                                logger.debug(f"Tool calls: {len(tool_calls)}")
+                            else:
+                                # No tools enabled, no tool calls possible
+                                tool_calls = []
+                                content_full = content_streamed
 
                             if tool_calls:
                                 # Clear streamed text and run tool flow
@@ -215,8 +222,15 @@ class ChatSession:
                                         })
 
                                 if tool_results:
+                                    # Add tool results to message history so model can respond
                                     for result in tool_results:
+                                        messages.append({
+                                            'role': 'tool',
+                                            'content': result['content']
+                                        })
                                         self.memory.add_message(self.config.session_id, 'system', f"Tool {result['name']}: {result['content']}")
+                                    # Continue loop to let model respond to tool results
+                                    continue
                                 break
                             else:
                                 # No tool calls; commit streamed content
