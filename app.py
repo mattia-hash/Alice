@@ -30,7 +30,7 @@ def main():
     setup_logging(config.log_level_str)
     logger = logging.getLogger(__name__)
     logger.info(f"Logging level set to: {config.log_level_str}")
-
+    
     # Initialize components
     logger.info(f"Initializing LLM client with URL: {config.llm_url}")
     logger.info(f"Model: {config.model_name}")

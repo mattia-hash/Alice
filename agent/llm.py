@@ -1,52 +1,77 @@
 """
-LLM interface with streaming support.
-Compatible with both Ollama and OpenAI-compatible APIs (like LM Studio).
+LLM interface using the ollama Python library.
+Supports basic authentication for reverse proxy setups.
 """
 
-import json
-import requests
-import warnings
+import base64
 import logging
+import warnings
 from typing import Iterator, Dict, List, Optional
-from urllib.parse import urlparse
+from ollama import Client
+import httpx
 
 # Disable SSL warnings for self-signed certificates
-warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+warnings.filterwarnings('ignore', message='.*Unverified HTTPS request.*')
+warnings.filterwarnings('ignore', message='.*verify=False.*')
 
-# Setup logging (will be configured by main app)
 logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """Streaming LLM client supporting multiple backends."""
+    """Ollama client with basic auth support."""
     
     def __init__(self, base_url: str, model_name: str, system_prompt: Optional[str] = None,
                  username: Optional[str] = None, password: Optional[str] = None,
                  context_length: Optional[int] = None):
         """
-        Initialize LLM client.
+        Initialize Ollama client.
         
         Args:
-            base_url: API endpoint URL (e.g., http://localhost:1234/v1/chat/completions)
+            base_url: API endpoint URL (e.g., http://your-server.com:11434/api/chat)
             model_name: Name of the model to use
             system_prompt: Optional system prompt
             username: Optional username for basic auth
             password: Optional password for basic auth
+            context_length: Optional context window size
         """
-        self.base_url = base_url
+        # Extract host from base_url (remove /api/chat or /api/generate paths)
+        host = base_url.replace('/api/chat', '').replace('/api/generate', '').replace('/v1/chat/completions', '')
+        
+        # Setup basic auth headers if credentials provided
+        headers = {}
+        if username and password:
+            credentials = f"{username}:{password}"
+            encoded = base64.b64encode(credentials.encode()).decode()
+            headers['Authorization'] = f'Basic {encoded}'
+            logger.info("Basic auth enabled for Ollama client")
+        
+        # Initialize the ollama client with just host and headers
+        # We'll configure SSL verification by monkey-patching after creation
+        self.client = Client(
+            host=host,
+            headers=headers if headers else None
+        )
+        
+        # Monkey-patch the httpx client to disable SSL verification
+        # This is necessary for self-signed certificates
+        if hasattr(self.client, '_client') and isinstance(self.client._client, httpx.Client):
+            # Replace the existing client with one that has verify=False
+            old_client = self.client._client
+            self.client._client = httpx.Client(
+                headers=headers if headers else None,
+                verify=False,
+                timeout=120.0,
+                base_url=host
+            )
+            old_client.close()
+            logger.info("SSL verification disabled via client patching")
         self.model_name = model_name
         self.system_prompt = system_prompt
-        self.auth = (username, password) if username and password else None
         self.context_length = context_length
+        self.base_url = host  # Keep for logging compatibility
         
-        # Detect API type based on URL
-        self.api_type = self._detect_api_type(base_url)
-    
-    def _detect_api_type(self, url: str) -> str:
-        """Detect if we're using Ollama or OpenAI-compatible API."""
-        if 'ollama' in url or '/api/chat' in url or '/api/generate' in url:
-            return 'ollama'
-        return 'openai'
+        logger.info(f"Ollama client initialized: {host}")
+        logger.info("SSL verification disabled (self-signed certificate support)")
     
     def _build_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Build message list with optional system prompt."""
@@ -55,236 +80,131 @@ class LLMClient:
         return messages
     
     def stream_chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, 
-                    tools: Optional[List[Dict]] = None) -> Iterator[str]:
+                    tools: Optional[List] = None) -> Iterator[str]:
         """
         Stream chat completion responses.
         
         Args:
             messages: List of message dicts with 'role' and 'content'
             temperature: Sampling temperature
-            tools: Optional list of tool schemas for function calling
+            tools: Optional list of callable functions for tool use
             
         Yields:
             Content chunks as they arrive
         """
         messages = self._build_messages(messages)
         
-        if self.api_type == 'ollama':
-            yield from self._stream_ollama(messages, temperature, tools)
-        else:
-            yield from self._stream_openai(messages, temperature, tools)
-    
-    def _stream_ollama(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
-        """Stream from Ollama API."""
-        # Check if using /api/generate (prompt-based) or /api/chat (message-based)
-        is_generate = '/api/generate' in self.base_url
+        # Build options
+        options = {'temperature': temperature}
+        if self.context_length:
+            options['num_ctx'] = int(self.context_length)
         
-        if is_generate:
-            # For /api/generate, we need to use prompt instead of messages
-            # Combine messages into a single prompt
-            prompt_parts = []
-            for msg in messages:
-                role = msg.get('role', '')
-                content = msg.get('content', '')
-                if role == 'system':
-                    prompt_parts.append(f"System: {content}")
-                elif role == 'user':
-                    prompt_parts.append(f"User: {content}")
-                elif role == 'assistant':
-                    prompt_parts.append(f"Assistant: {content}")
+        try:
+            logger.debug(f"Streaming request to {self.model_name} with tools: {tools is not None}")
             
-            prompt = '\n\n'.join(prompt_parts) + '\n\nAssistant:'
+            # Stream with tools if provided
+            stream = self.client.chat(
+                model=self.model_name,
+                messages=messages,
+                tools=tools,
+                options=options,
+                stream=True
+            )
             
-            payload = {
-                'model': self.model_name,
-                'prompt': prompt,
-                'stream': True,
-                'options': {
-                    'temperature': temperature
-                }
-            }
-        else:
-            # For /api/chat, use messages format
-            payload = {
-                'model': self.model_name,
-                'messages': messages,
-                'stream': True,
-                'options': {
-                    'temperature': temperature
-                }
-            }
-            
-            # Add tools if provided (only for /api/chat)
-            if tools:
-                payload['tools'] = tools
-        
-        # Inject context length for Ollama, if provided
-        try:
-            if self.context_length and isinstance(payload, dict):
-                options = payload.setdefault('options', {})
-                # Ollama expects 'num_ctx' (context window tokens)
-                options['num_ctx'] = int(self.context_length)
-        except Exception:
-            pass
-
-        logger.debug(f"Ollama request to {self.base_url}")
-        logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-        logger.debug(f"Auth: {'Enabled' if self.auth else 'Disabled'}")
-        
-        try:
-            with requests.post(self.base_url, json=payload, stream=True, timeout=120, auth=self.auth, verify=False) as response:
-                logger.debug(f"Response status: {response.status_code}")
-                logger.debug(f"Response headers: {dict(response.headers)}")
-                response.raise_for_status()
-                
-                line_count = 0
-                for line in response.iter_lines():
-                    if line:
-                        line_count += 1
-                        logger.debug(f"Line {line_count}: {line[:200]}")  # Log first 200 chars
-                        try:
-                            chunk = json.loads(line)
-                            # Handle both /api/chat and /api/generate formats
-                            if 'message' in chunk and 'content' in chunk['message']:
-                                content = chunk['message']['content']
-                                if content:
-                                    yield content
-                            elif 'response' in chunk:  # /api/generate format
-                                content = chunk['response']
-                                if content:
-                                    yield content
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON decode error: {e}, Line: {line}")
-                            continue
-                
-                logger.debug(f"Total lines received: {line_count}")
-                            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error: {str(e)}")
-            yield f"\n[Error: {str(e)}]"
-    
-    def _stream_openai(self, messages: List[Dict], temperature: float, tools: Optional[List[Dict]] = None) -> Iterator[str]:
-        """Stream from OpenAI-compatible API (LM Studio, etc.)."""
-        payload = {
-            'model': self.model_name,
-            'messages': messages,
-            'stream': True,
-            'temperature': temperature
-        }
-        
-        # Add tools if provided
-        if tools:
-            payload['tools'] = tools
-        
-        # Best-effort: map context length to OpenAI-compatible 'max_tokens' (output limit)
-        try:
-            if self.context_length:
-                payload['max_tokens'] = int(self.context_length)
-        except Exception:
-            pass
-
-        try:
-            with requests.post(self.base_url, json=payload, stream=True, timeout=120, auth=self.auth, verify=False) as response:
-                response.raise_for_status()
-                
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
+            for chunk in stream:
+                # Handle ChatResponse object - access as dict or object attributes
+                if hasattr(chunk, 'message'):
+                    # Object attribute access
+                    message = chunk.message
+                    if hasattr(message, 'content'):
+                        content = message.content
+                        if content:
+                            yield content
+                elif isinstance(chunk, dict):
+                    # Dictionary access (fallback)
+                    if 'message' in chunk and 'content' in chunk['message']:
+                        content = chunk['message']['content']
+                        if content:
+                            yield content
                         
-                        # OpenAI streaming format: "data: {json}"
-                        if line.startswith('data: '):
-                            line = line[6:]  # Remove "data: " prefix
-                            
-                            if line.strip() == '[DONE]':
-                                break
-                            
-                            try:
-                                chunk = json.loads(line)
-                                if 'choices' in chunk and len(chunk['choices']) > 0:
-                                    delta = chunk['choices'][0].get('delta', {})
-                                    content = delta.get('content', '')
-                                    if content:
-                                        yield content
-                            except json.JSONDecodeError:
-                                continue
-                                
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
+            logger.error(f"Streaming error: {str(e)}")
             yield f"\n[Error: {str(e)}]"
     
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, 
-             tools: Optional[List[Dict]] = None) -> Dict:
+             tools: Optional[List] = None) -> Dict:
         """
         Non-streaming chat completion (collects full response including tool calls).
         
         Args:
             messages: List of message dicts
             temperature: Sampling temperature
-            tools: Optional list of tool schemas
+            tools: Optional list of callable functions
             
         Returns:
-            Dict with 'content' (text) and optional 'tool_calls' (list)
+            Dict with 'content' (text) and 'tool_calls' (list)
         """
         messages = self._build_messages(messages)
         
-        payload = {
-            'model': self.model_name,
-            'messages': messages,
-            'temperature': temperature,
-            'stream': False
-        }
-        
-        if tools:
-            payload['tools'] = tools
-        
-        # Inject context length per backend
-        try:
-            if self.api_type == 'ollama':
-                options = payload.setdefault('options', {})
-                options['temperature'] = temperature
-                if self.context_length:
-                    options['num_ctx'] = int(self.context_length)
-            else:
-                if self.context_length:
-                    payload['max_tokens'] = int(self.context_length)
-        except Exception:
-            pass
+        # Build options
+        options = {'temperature': temperature}
+        if self.context_length:
+            options['num_ctx'] = int(self.context_length)
         
         try:
-            logger.debug(f"Non-streaming request to {self.base_url}")
-            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-            response = requests.post(self.base_url, json=payload, timeout=120, auth=self.auth, verify=False)
-            logger.debug(f"Response status: {response.status_code}")
-            response.raise_for_status()
-            data = response.json()
-            logger.debug(f"Response data: {json.dumps(data, indent=2)[:500]}")
+            logger.debug(f"Non-streaming request to {self.model_name}")
+            logger.debug(f"Tools provided: {tools is not None}")
             
-            # Parse response based on API type
-            if self.api_type == 'ollama':
-                message = data.get('message', {})
+            # Call ollama with tools directly
+            response = self.client.chat(
+                model=self.model_name,
+                messages=messages,
+                tools=tools,
+                options=options,
+                stream=False
+            )
+            
+            logger.debug(f"Response type: {type(response)}")
+            
+            # Parse response - ollama returns a ChatResponse object
+            if hasattr(response, 'message'):
+                # Object attribute access
+                message = response.message
+                content = getattr(message, 'content', '')
+                tool_calls = getattr(message, 'tool_calls', []) or []
+                if tool_calls:
+                    logger.debug(f"Tool calls found: {len(tool_calls)}")
+                return {
+                    'content': content,
+                    'tool_calls': tool_calls
+                }
+            elif isinstance(response, dict):
+                # Dictionary access (fallback)
+                message = response.get('message', {})
+                tool_calls = message.get('tool_calls', [])
+                logger.debug(f"Tool calls found: {len(tool_calls)}")
                 return {
                     'content': message.get('content', ''),
-                    'tool_calls': message.get('tool_calls', [])
+                    'tool_calls': tool_calls
                 }
-            else:  # OpenAI format
-                if 'choices' in data and len(data['choices']) > 0:
-                    message = data['choices'][0].get('message', {})
-                    return {
-                        'content': message.get('content', ''),
-                        'tool_calls': message.get('tool_calls', [])
-                    }
+            else:
+                logger.error(f"Unexpected response format: {response}")
+                return {'content': '', 'tool_calls': []}
             
-            return {'content': '', 'tool_calls': []}
-            
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
+            logger.error(f"Chat error: {str(e)}")
             return {'content': f"[Error: {str(e)}]", 'tool_calls': []}
     
     def parse_action(self, response: str) -> Dict:
         """
         Parse LLM response for action commands.
         
+        Legacy method kept for backwards compatibility with non-function-calling mode.
         Tries to extract JSON action from response.
         Returns structured action dict or defaults to 'respond' action.
         """
+        import json
+        
         # Try to find JSON in the response
         response = response.strip()
         
@@ -308,4 +228,3 @@ class LLMClient:
             'action': 'respond',
             'text': response
         }
-

@@ -7,6 +7,7 @@ import subprocess
 import json
 import os
 from typing import List, Dict, Optional, Tuple, Any
+import shlex
 
 
 class CommandExecutor:
@@ -213,55 +214,74 @@ class CommandExecutor:
             }
 
 
-# LangGraph-compatible tool function
-def execute_command(command: str, args: List[str] = None) -> Dict:
+# Tool function for ollama library (receives full command string)
+def execute_command(command: str) -> Dict:
     """
-    LangGraph-compatible tool function for command execution.
+    Execute a terminal command safely on Windows. The command will be shown to the user for confirmation before execution. Only commands in the allowlist are permitted (dir, type, cd, where, tree, echo, etc.).
     
     Args:
-        command: The command to execute
-        args: List of command arguments (optional)
+        command: Full command to execute, including arguments (e.g., 'dir /b' or 'type README.md')
         
     Returns:
-        Execution result dictionary
+        Execution result with success status, stdout, stderr, and exit code
     """
-    if args is None:
-        args = []
+    if not command or not command.strip():
+        return {
+            "success": False, 
+            "error": "No command provided", 
+            "stdout": "", 
+            "stderr": "", 
+            "exit_code": -1,
+            "cwd": os.getcwd()
+        }
+    
+    # Parse into base command and args
+    try:
+        parts = shlex.split(command, posix=(os.name != 'nt'))
+    except ValueError:
+        # Fallback naive split
+        parts = command.split()
+    
+    base_command = parts[0] if parts else ""
+    args = parts[1:] if len(parts) > 1 else []
+    
     executor = CommandExecutor()
-    return executor.execute(command, args)
+    return executor.execute(base_command, args)
 
 
-# Tool schema for function calling (OpenAI format)
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "Execute a terminal command safely. The command will be shown to the user for confirmation before execution. Only commands in the allowlist are permitted (ls, cat, pwd, git, docker, python, etc.).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The base command to execute (e.g., 'ls', 'git', 'python', 'cat')"
+# For ollama library: Return actual callable functions instead of JSON schemas
+def get_tool_functions() -> List:
+    """Get list of actual callable tool functions for ollama."""
+    return [execute_command]
+
+
+# Legacy: Keep for backwards compatibility with schema-based approaches
+def get_tool_schemas() -> List[Dict]:
+    """
+    Get tool schemas in OpenAI format (legacy).
+    
+    Note: When using the ollama library, use get_tool_functions() instead.
+    This is kept for backwards compatibility only.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_command",
+                "description": "Execute a terminal command safely on Windows. The command will be shown to the user for confirmation before execution. Only commands in the allowlist are permitted (dir, type, cd, where, tree, echo, etc.).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Full command to execute, including arguments (e.g., 'dir /b' or 'type README.md')"
+                        }
                     },
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of command arguments (e.g., ['-la', '/home/user'] for 'ls -la /home/user')",
-                        "default": []
-                    }
-                },
-                "required": ["command"]
+                    "required": ["command"]
+                }
             }
         }
-    }
-]
-
-
-def get_tool_schemas() -> List[Dict]:
-    """Get all available tool schemas for function calling."""
-    return TOOL_SCHEMAS
+    ]
 
 
 def execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict:
@@ -276,9 +296,11 @@ def execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> Dict:
         Tool execution result
     """
     if tool_name == "execute_command":
-        command = tool_args.get("command", "")
-        args = tool_args.get("args", [])
-        return execute_command(command, args)
+        full_cmd = (tool_args.get("command") or "").strip()
+        if not full_cmd:
+            return {"success": False, "error": "No command provided"}
+        # Call the updated execute_command that takes a full command string
+        return execute_command(full_cmd)
     else:
         return {
             "success": False,

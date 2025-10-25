@@ -1,6 +1,7 @@
 # Core dependencies
 python-dotenv>=1.0.0
 requests>=2.31.0
+ollama>=0.1.0
 
 # Note: sqlite3 is part of Python's standard library (built-in)
 
